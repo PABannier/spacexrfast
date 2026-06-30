@@ -1,0 +1,12 @@
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+
+*.tar.gz
+*.Rcheck/
+
+src/*.o
+src/*.so
+src/*.dll
+src/symbols.rds
