@@ -1,7 +1,10 @@
+// [[Rcpp::depends(RcppEigen)]]
 #include <Rcpp.h>
+#include <Eigen/Dense>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -143,6 +146,15 @@ inline void psd_project_2x2(double& a, double& b, double& c, double epsilon = 0.
   c = lambda1 * v1y * v1y + lambda2 * v2y * v2y;
 }
 
+Eigen::MatrixXd psd_project_general(const Eigen::MatrixXd& hess, double epsilon = 0.001) {
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(hess);
+  if (eig.info() != Eigen::Success) {
+    return hess + epsilon * Eigen::MatrixXd::Identity(hess.rows(), hess.cols());
+  }
+  Eigen::VectorXd values = eig.eigenvalues().cwiseMax(epsilon);
+  return eig.eigenvectors() * values.asDiagonal() * eig.eigenvectors().transpose();
+}
+
 inline double objective_1d(double d, double D, double u) {
   return 0.5 * D * u * u - d * u;
 }
@@ -212,6 +224,180 @@ inline std::vector<double> solve_qp_equality_bounds(const std::vector<double>& d
   return {u0, rhs - u0};
 }
 
+std::vector<int> complement_indices(const std::vector<unsigned char>& active) {
+  std::vector<int> out;
+  out.reserve(active.size());
+  for (int i = 0; i < static_cast<int>(active.size()); ++i) {
+    if (!active[i]) out.push_back(i);
+  }
+  return out;
+}
+
+Eigen::VectorXd solve_bound_qp_general(const Eigen::MatrixXd& D,
+                                       const Eigen::VectorXd& d,
+                                       const Eigen::VectorXd& lb) {
+  const int n = d.size();
+  Eigen::VectorXd u = D.ldlt().solve(d);
+  std::vector<unsigned char> active(n, 0);
+  for (int i = 0; i < n; ++i) {
+    if (!std::isfinite(u[i]) || u[i] < lb[i]) {
+      active[i] = 1;
+      u[i] = lb[i];
+    }
+  }
+
+  const double tol = 1e-10;
+  for (int iter = 0; iter < 4 * n + 20; ++iter) {
+    std::vector<int> free_idx = complement_indices(active);
+    for (int i = 0; i < n; ++i) {
+      if (active[i]) u[i] = lb[i];
+    }
+
+    if (!free_idx.empty()) {
+      Eigen::MatrixXd Dff(free_idx.size(), free_idx.size());
+      Eigen::VectorXd rhs(free_idx.size());
+      for (int ii = 0; ii < static_cast<int>(free_idx.size()); ++ii) {
+        const int i = free_idx[ii];
+        rhs[ii] = d[i];
+        for (int a = 0; a < n; ++a) {
+          if (active[a]) rhs[ii] -= D(i, a) * lb[a];
+        }
+        for (int jj = 0; jj < static_cast<int>(free_idx.size()); ++jj) {
+          Dff(ii, jj) = D(i, free_idx[jj]);
+        }
+      }
+      Eigen::VectorXd uf = Dff.ldlt().solve(rhs);
+      for (int ii = 0; ii < static_cast<int>(free_idx.size()); ++ii) {
+        u[free_idx[ii]] = uf[ii];
+      }
+    }
+
+    double worst_violation = 0.0;
+    int worst_idx = -1;
+    for (int i = 0; i < n; ++i) {
+      if (!active[i] && (!std::isfinite(u[i]) || u[i] < lb[i] - tol)) {
+        const double violation = lb[i] - u[i];
+        if (violation > worst_violation) {
+          worst_violation = violation;
+          worst_idx = i;
+        }
+      }
+    }
+    if (worst_idx >= 0) {
+      active[worst_idx] = 1;
+      u[worst_idx] = lb[worst_idx];
+      continue;
+    }
+
+    Eigen::VectorXd grad = D * u - d;
+    double most_negative = 0.0;
+    int release_idx = -1;
+    for (int i = 0; i < n; ++i) {
+      if (active[i] && grad[i] < most_negative - tol) {
+        most_negative = grad[i];
+        release_idx = i;
+      }
+    }
+    if (release_idx >= 0) {
+      active[release_idx] = 0;
+      continue;
+    }
+    return u;
+  }
+
+  for (int i = 0; i < n; ++i) {
+    if (!std::isfinite(u[i]) || u[i] < lb[i]) u[i] = lb[i];
+  }
+  return u;
+}
+
+Eigen::VectorXd solve_equality_bound_qp_general(const Eigen::MatrixXd& D,
+                                                const Eigen::VectorXd& d,
+                                                const Eigen::VectorXd& lb,
+                                                double rhs_sum) {
+  const int n = d.size();
+  Eigen::VectorXd u = Eigen::VectorXd::Constant(n, rhs_sum / static_cast<double>(n));
+  std::vector<unsigned char> active(n, 0);
+  for (int i = 0; i < n; ++i) {
+    if (u[i] < lb[i]) {
+      active[i] = 1;
+      u[i] = lb[i];
+    }
+  }
+
+  double lambda = 0.0;
+  const double tol = 1e-10;
+  for (int iter = 0; iter < 4 * n + 20; ++iter) {
+    std::vector<int> free_idx = complement_indices(active);
+    for (int i = 0; i < n; ++i) {
+      if (active[i]) u[i] = lb[i];
+    }
+    if (free_idx.empty()) return u;
+
+    const int nf = free_idx.size();
+    Eigen::MatrixXd kkt(nf + 1, nf + 1);
+    Eigen::VectorXd krhs(nf + 1);
+    kkt.setZero();
+    for (int ii = 0; ii < nf; ++ii) {
+      const int i = free_idx[ii];
+      krhs[ii] = d[i];
+      for (int a = 0; a < n; ++a) {
+        if (active[a]) krhs[ii] -= D(i, a) * lb[a];
+      }
+      for (int jj = 0; jj < nf; ++jj) {
+        kkt(ii, jj) = D(i, free_idx[jj]);
+      }
+      kkt(ii, nf) = 1.0;
+      kkt(nf, ii) = 1.0;
+    }
+    double active_sum = 0.0;
+    for (int i = 0; i < n; ++i) if (active[i]) active_sum += lb[i];
+    krhs[nf] = rhs_sum - active_sum;
+
+    Eigen::VectorXd sol = kkt.fullPivLu().solve(krhs);
+    for (int ii = 0; ii < nf; ++ii) u[free_idx[ii]] = sol[ii];
+    lambda = sol[nf];
+
+    double worst_violation = 0.0;
+    int worst_idx = -1;
+    for (int i = 0; i < n; ++i) {
+      if (!active[i] && (!std::isfinite(u[i]) || u[i] < lb[i] - tol)) {
+        const double violation = lb[i] - u[i];
+        if (violation > worst_violation) {
+          worst_violation = violation;
+          worst_idx = i;
+        }
+      }
+    }
+    if (worst_idx >= 0) {
+      active[worst_idx] = 1;
+      u[worst_idx] = lb[worst_idx];
+      continue;
+    }
+
+    Eigen::VectorXd grad = D * u - d;
+    double most_negative = 0.0;
+    int release_idx = -1;
+    for (int i = 0; i < n; ++i) {
+      const double mu = grad[i] + lambda;
+      if (active[i] && mu < most_negative - tol) {
+        most_negative = mu;
+        release_idx = i;
+      }
+    }
+    if (release_idx >= 0) {
+      active[release_idx] = 0;
+      continue;
+    }
+    return u;
+  }
+
+  for (int i = 0; i < n; ++i) {
+    if (!std::isfinite(u[i]) || u[i] < lb[i]) u[i] = lb[i];
+  }
+  return u;
+}
+
 FitResult solve_irwls(const std::vector<double>& y,
                       const std::vector<int>& types,
                       const std::vector<double>& ref,
@@ -223,6 +409,93 @@ FitResult solve_irwls(const std::vector<double>& y,
                       double min_change,
                       bool constrain) {
   const int k = static_cast<int>(types.size());
+  if (k > 2) {
+    std::vector<double> solution(k, 1.0 / static_cast<double>(k));
+    double change = 1.0;
+    int iterations = 0;
+
+    std::vector<double> S(static_cast<std::size_t>(n_genes) * k);
+    std::vector<double> prediction(n_genes);
+    for (int a = 0; a < k; ++a) {
+      const int type = types[a];
+      for (int g = 0; g < n_genes; ++g) {
+        S[g + static_cast<std::size_t>(a) * n_genes] = nUMI * ref[g + type * n_genes];
+      }
+    }
+
+    while (change > min_change && iterations < n_iter) {
+      std::vector<double> current(k);
+      for (int a = 0; a < k; ++a) {
+        current[a] = std::max(solution[a], 0.0);
+      }
+
+      const double threshold = std::max(1e-4, nUMI * 1e-7);
+      for (int g = 0; g < n_genes; ++g) {
+        double pred = 0.0;
+        for (int a = 0; a < k; ++a) {
+          pred += S[g + static_cast<std::size_t>(a) * n_genes] * current[a];
+        }
+        pred = std::abs(pred);
+        prediction[g] = pred < threshold ? threshold : pred;
+      }
+
+      Eigen::VectorXd grad(k);
+      Eigen::MatrixXd hess(k, k);
+      grad.setZero();
+      hess.setZero();
+      for (int g = 0; g < n_genes; ++g) {
+        const QDerivatives qd = calc_q_all_one(y[g], prediction[g], tables);
+        for (int a = 0; a < k; ++a) {
+          const double sa = S[g + static_cast<std::size_t>(a) * n_genes];
+          grad[a] += -qd.d1 * sa;
+          for (int b = a; b < k; ++b) {
+            const double sb = S[g + static_cast<std::size_t>(b) * n_genes];
+            hess(a, b) += -qd.d2 * sa * sb;
+          }
+        }
+      }
+      for (int a = 0; a < k; ++a) {
+        for (int b = a + 1; b < k; ++b) {
+          hess(b, a) = hess(a, b);
+        }
+      }
+
+      Eigen::VectorXd d = -grad;
+      Eigen::MatrixXd D = psd_project_general(hess);
+      Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(D);
+      double norm_factor = eig.eigenvalues().maxCoeff();
+      if (!std::isfinite(norm_factor) || norm_factor <= 0.0) norm_factor = 1.0;
+      D /= norm_factor;
+      d /= norm_factor;
+      D += 1e-7 * Eigen::MatrixXd::Identity(k, k);
+
+      Eigen::VectorXd lb(k);
+      for (int a = 0; a < k; ++a) {
+        lb[a] = -current[a];
+      }
+
+      Eigen::VectorXd step = constrain
+        ? solve_equality_bound_qp_general(D, d, lb, 1.0 - std::accumulate(current.begin(), current.end(), 0.0))
+        : solve_bound_qp_general(D, d, lb);
+
+      const double alpha = 0.3;
+      std::vector<double> new_solution(k);
+      change = 0.0;
+      for (int a = 0; a < k; ++a) {
+        new_solution[a] = current[a] + alpha * step[a];
+        const double diff = new_solution[a] - solution[a];
+        change += std::abs(diff);
+      }
+      solution.swap(new_solution);
+      ++iterations;
+    }
+
+    FitResult result;
+    result.weights = solution;
+    result.converged = change <= min_change;
+    return result;
+  }
+
   std::vector<double> solution(k, 1.0 / static_cast<double>(k));
   double change = 1.0;
   int iterations = 0;
@@ -305,9 +578,8 @@ FitResult solve_irwls(const std::vector<double>& y,
     for (int i = 0; i < k; ++i) {
       new_solution[i] = current[i] + alpha * step[i];
       const double diff = new_solution[i] - solution[i];
-      change += diff * diff;
+      change += std::abs(diff);
     }
-    change = std::sqrt(change);
     solution.swap(new_solution);
     ++iterations;
   }
@@ -416,8 +688,6 @@ struct FastDoubletWorker {
   const std::vector<double>& beads;
   const std::vector<double>& nUMI;
   const std::vector<double>& ref;
-  const std::vector<double>& all_weights;
-  const std::vector<unsigned char>& conv_all_in;
   const std::vector<int>& class_ids;
   const LikelihoodTables& tables;
   const int n_cells;
@@ -429,6 +699,8 @@ struct FastDoubletWorker {
   const double doublet_threshold;
   const bool return_diagnostics;
 
+  std::vector<double>& all_weights_out;
+  std::vector<unsigned char>& conv_all_out;
   std::vector<int>& spot_class;
   std::vector<int>& first_type;
   std::vector<int>& second_type;
@@ -446,8 +718,6 @@ struct FastDoubletWorker {
   FastDoubletWorker(const std::vector<double>& beads,
                     const std::vector<double>& nUMI,
                     const std::vector<double>& ref,
-                    const std::vector<double>& all_weights,
-                    const std::vector<unsigned char>& conv_all_in,
                     const std::vector<int>& class_ids,
                     const LikelihoodTables& tables,
                     int n_cells,
@@ -458,6 +728,8 @@ struct FastDoubletWorker {
                     double confidence_threshold,
                     double doublet_threshold,
                     bool return_diagnostics,
+                    std::vector<double>& all_weights_out,
+                    std::vector<unsigned char>& conv_all_out,
                     std::vector<int>& spot_class,
                     std::vector<int>& first_type,
                     std::vector<int>& second_type,
@@ -471,11 +743,11 @@ struct FastDoubletWorker {
                     std::vector<std::vector<double>>& score_mats,
                     std::vector<std::vector<double>>& singlet_scores_out,
                     std::vector<std::vector<int>>& diagnostic_candidates)
-      : beads(beads), nUMI(nUMI), ref(ref), all_weights(all_weights),
-        conv_all_in(conv_all_in), class_ids(class_ids), tables(tables),
+      : beads(beads), nUMI(nUMI), ref(ref), class_ids(class_ids), tables(tables),
         n_cells(n_cells), n_genes(n_genes), n_types(n_types), constrain(constrain),
         min_change(min_change), confidence_threshold(confidence_threshold),
         doublet_threshold(doublet_threshold), return_diagnostics(return_diagnostics),
+        all_weights_out(all_weights_out), conv_all_out(conv_all_out),
         spot_class(spot_class), first_type(first_type), second_type(second_type),
         first_class(first_class), second_class(second_class), first_weight(first_weight),
         second_weight(second_weight), min_score_out(min_score_out),
@@ -490,10 +762,19 @@ struct FastDoubletWorker {
         y[g] = beads[cell + static_cast<std::size_t>(g) * n_cells];
       }
 
+      std::vector<int> all_types(n_types);
+      std::iota(all_types.begin(), all_types.end(), 0);
+      FitResult full_fit = solve_irwls(y, all_types, ref, n_genes, n_types, nUMI[cell],
+                                       tables, 50, min_change, constrain);
+      conv_all_out[cell] = full_fit.converged;
+      for (int t = 0; t < n_types; ++t) {
+        all_weights_out[cell + static_cast<std::size_t>(t) * n_cells] = full_fit.weights[t];
+      }
+
       std::vector<int> candidates;
       candidates.reserve(n_types);
       for (int t = 0; t < n_types; ++t) {
-        if (all_weights[cell + static_cast<std::size_t>(t) * n_cells] > 0.01) {
+        if (full_fit.weights[t] > 0.01) {
           candidates.push_back(t);
         }
       }
@@ -616,8 +897,6 @@ std::vector<double> numeric_matrix_to_vector(const NumericMatrix& matrix) {
 List fast_doublet_chunk_cpp(NumericMatrix beads,
                             NumericVector nUMI,
                             NumericMatrix ref_profiles,
-                            NumericMatrix all_weights,
-                            LogicalVector conv_all,
                             IntegerVector class_ids,
                             NumericMatrix Q_mat,
                             NumericMatrix SQ_mat,
@@ -636,9 +915,6 @@ List fast_doublet_chunk_cpp(NumericMatrix beads,
   if (ref_genes != n_genes) {
     Rcpp::stop("fast_doublet_chunk_cpp: ref_profiles rows must match bead columns.");
   }
-  if (all_weights.nrow() != n_cells || all_weights.ncol() != n_types) {
-    Rcpp::stop("fast_doublet_chunk_cpp: all_weights dimensions must be cells x types.");
-  }
   if (n_types < 2) {
     Rcpp::stop("fast_doublet_chunk_cpp: at least two cell types are required.");
   }
@@ -654,13 +930,10 @@ List fast_doublet_chunk_cpp(NumericMatrix beads,
   std::vector<double> beads_vec = numeric_matrix_to_vector(beads);
   std::vector<double> nUMI_vec(nUMI.begin(), nUMI.end());
   std::vector<double> ref_vec = numeric_matrix_to_vector(ref_profiles);
-  std::vector<double> all_weights_vec = numeric_matrix_to_vector(all_weights);
   std::vector<int> class_vec(class_ids.begin(), class_ids.end());
-  std::vector<unsigned char> conv_all_vec(conv_all.size());
-  for (R_xlen_t i = 0; i < conv_all.size(); ++i) {
-    conv_all_vec[i] = static_cast<unsigned char>(conv_all[i] == TRUE);
-  }
 
+  std::vector<double> all_weights_out(static_cast<std::size_t>(n_cells) * n_types);
+  std::vector<unsigned char> conv_all_out(n_cells);
   std::vector<int> spot_class(n_cells);
   std::vector<int> first_type(n_cells);
   std::vector<int> second_type(n_cells);
@@ -675,10 +948,11 @@ List fast_doublet_chunk_cpp(NumericMatrix beads,
   std::vector<std::vector<double>> singlet_scores(n_cells);
   std::vector<std::vector<int>> diagnostic_candidates(n_cells);
 
-  FastDoubletWorker worker(beads_vec, nUMI_vec, ref_vec, all_weights_vec, conv_all_vec,
-                           class_vec, tables, n_cells, n_genes, n_types, constrain,
+  FastDoubletWorker worker(beads_vec, nUMI_vec, ref_vec, class_vec, tables,
+                           n_cells, n_genes, n_types, constrain,
                            min_change, confidence_threshold, doublet_threshold,
-                           return_diagnostics, spot_class, first_type, second_type,
+                           return_diagnostics, all_weights_out, conv_all_out,
+                           spot_class, first_type, second_type,
                            first_class, second_class, first_weight, second_weight,
                            min_score_out, singlet_score_out, conv_doublet, score_mats,
                            singlet_scores, diagnostic_candidates);
@@ -704,13 +978,20 @@ List fast_doublet_chunk_cpp(NumericMatrix beads,
   }
 
   LogicalVector first_class_out(n_cells), second_class_out(n_cells), conv_doublet_out(n_cells);
+  LogicalVector conv_all_logical(n_cells);
   for (int i = 0; i < n_cells; ++i) {
     first_class_out[i] = first_class[i] != 0;
     second_class_out[i] = second_class[i] != 0;
     conv_doublet_out[i] = conv_doublet[i] != 0;
+    conv_all_logical[i] = conv_all_out[i] != 0;
   }
 
+  NumericMatrix all_weights_matrix(n_cells, n_types);
+  std::copy(all_weights_out.begin(), all_weights_out.end(), all_weights_matrix.begin());
+
   List out = List::create(
+    Rcpp::Named("all_weights") = all_weights_matrix,
+    Rcpp::Named("conv_all") = conv_all_logical,
     Rcpp::Named("spot_class") = spot_labels,
     Rcpp::Named("first_type") = IntegerVector(first_type.begin(), first_type.end()),
     Rcpp::Named("second_type") = IntegerVector(second_type.begin(), second_type.end()),

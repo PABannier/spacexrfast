@@ -46,8 +46,6 @@ test_that("C++ doublet chunk matches upstream categorical outputs on synthetic d
     beads = beads,
     nUMI = as.numeric(nUMI),
     ref_profiles = data.matrix(profiles),
-    all_weights = all_weights,
-    conv_all = conv_all,
     class_ids = seq_len(n_types),
     Q_mat = q_mat,
     SQ_mat = sq_mat,
@@ -64,6 +62,9 @@ test_that("C++ doublet chunk matches upstream categorical outputs on synthetic d
   expect_identical(fast$spot_class, vapply(vanilla, function(x) as.character(x$spot_class), character(1)))
   expect_identical(fast$first_type, match(vapply(vanilla, `[[`, character(1), "first_type"), types))
   expect_identical(fast$second_type, match(vapply(vanilla, `[[`, character(1), "second_type"), types))
+  expect_lt(max(abs(fast$all_weights - all_weights)), 1e-4)
+  expect_lt(max(abs(fast$first_weight - vapply(vanilla, function(x) unname(x$doublet_weights[[1]]), numeric(1)))), 1e-4)
+  expect_lt(max(abs(fast$second_weight - vapply(vanilla, function(x) unname(x$doublet_weights[[2]]), numeric(1)))), 1e-4)
   expect_lt(max(abs(fast$min_score - vapply(vanilla, `[[`, numeric(1), "min_score"))), 1e-3)
 })
 
@@ -116,4 +117,6 @@ test_that("run.RCTD.fast.doublet preserves the doublet result schema", {
   expect_identical(as.character(fast@results$results_df$spot_class), as.character(vanilla@results$results_df$spot_class))
   expect_identical(as.character(fast@results$results_df$first_type), as.character(vanilla@results$results_df$first_type))
   expect_identical(as.character(fast@results$results_df$second_type), as.character(vanilla@results$results_df$second_type))
+  expect_lt(max(abs(as.matrix(fast@results$weights) - as.matrix(vanilla@results$weights))), 1e-4)
+  expect_lt(max(abs(as.matrix(fast@results$weights_doublet) - as.matrix(vanilla@results$weights_doublet))), 1e-4)
 })

@@ -18,7 +18,8 @@ Imports:
     Rcpp,
     spacexr
 LinkingTo:
-    Rcpp
+    Rcpp,
+    RcppEigen
 Suggests:
     rhdf5,
     Seurat,

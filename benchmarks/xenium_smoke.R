@@ -108,3 +108,15 @@ cat(
   "\n",
   sep = ""
 )
+cat(
+  "weights_max_abs_diff,",
+  max(abs(as.matrix(vanilla@results$weights) - as.matrix(fast@results$weights))),
+  "\n",
+  sep = ""
+)
+cat(
+  "weights_doublet_max_abs_diff,",
+  max(abs(as.matrix(vanilla@results$weights_doublet) - as.matrix(fast@results$weights_doublet))),
+  "\n",
+  sep = ""
+)

@@ -4,12 +4,12 @@
 [![Language: R + C++](https://img.shields.io/badge/built%20with-R%20%2B%20C%2B%2B-198ce7.svg)](https://www.rcpp.org/)
 [![Version](https://img.shields.io/badge/version-0.1.0-brightgreen.svg)](DESCRIPTION)
 
-**A drop-in, exact-preserving doublet-mode backend for [spacexr](https://github.com/dmcable/spacexr) RCTD — up to 15× faster on Xenium slides, with identical cell-type calls.**
+**A drop-in, exact-preserving doublet-mode backend for [spacexr](https://github.com/dmcable/spacexr) RCTD — much faster on Xenium slides, with identical cell-type calls.**
 
 RCTD doublet mode is the accuracy gold standard for cell-type deconvolution of spatial
 transcriptomics, but it was never built for million-cell Xenium slides — a single slide can
-take ~10 hours on 8 cores. `spacexrfast` keeps every bit of RCTD's preprocessing, statistics,
-and output schema, and rewrites only the hot per-cell scoring loop in parallel C++.
+take ~10 hours on 8 cores. `spacexrfast` keeps RCTD's preprocessing, statistics,
+and output schema, and moves the per-cell doublet fitting path into parallel C++.
 
 ```r
 library(spacexr)
@@ -43,14 +43,13 @@ millions of cells, that overhead dominates.
   `first_class`, `second_class`) match upstream RCTD bit-for-bit on the validation suite. The
   candidate threshold (`all_weights > 0.01`), fallback logic, tie-breaking, factor levels, and
   confidence/doublet thresholds are all reproduced exactly.
-- **Hot path in C++.** Likelihood-table interpolation, one- and two-type IRWLS, singlet scoring,
-  the candidate-pair loop, the final selected-pair refit, and the per-cell classification all run
-  as compiled code — no R or `quadprog` calls in the inner loop.
+- **Hot path in C++.** Likelihood-table interpolation, all-type IRWLS, two-type IRWLS, singlet
+  scoring, the candidate-pair loop, the final selected-pair refit, and per-cell classification all
+  run as compiled code — no R or `quadprog` calls in the inner loop.
 - **Parallel over cells.** The C++ backend fans out across `max_cores` threads with no R API
   access from workers, so it scales cleanly on multi-core machines.
-- **Closed-form two-type solver.** The repeated two-type QP that RCTD hands to `quadprog` is
-  replaced by an exact active-set solver specialized for the 2D subproblem — same math, no
-  optimizer overhead, thread-safe.
+- **Active-set QP solvers.** The repeated WLS QP subproblems that RCTD hands to `quadprog` are
+  replaced by thread-safe C++ active-set solvers for all-type and two-type fits.
 - **Adaptive chunking.** Cells are processed in dense gene × chunk blocks sized to a memory
   budget (`chunk_size = "auto"`), keeping peak RAM bounded even on million-cell slides.
 - **Drop-in API, drop-in schema.** Keep upstream gene filtering, platform normalization, sigma
@@ -103,8 +102,27 @@ run.RCTD.fast.doublet(
   chunk_size = NULL,          # cells per dense chunk; NULL or "auto" picks adaptively
   exact = TRUE,               # exact mode (approximate mode is not yet implemented)
   return_diagnostics = FALSE, # attach per-cell pair-score matrices + singlet scores
-  validate_inputs = TRUE      # validate the RCTD object before running
+  validate_inputs = TRUE,     # validate the RCTD object before running
+  progress = interactive()    # print chunk progress, elapsed time, ETA, cells/s
 )
+```
+
+For long Xenium runs, force progress output even in batch jobs:
+
+```r
+rctd <- run.RCTD.fast.doublet(
+  rctd,
+  max_cores = 4,
+  chunk_size = 10000,
+  progress = TRUE
+)
+```
+
+Example progress output:
+
+```text
+run.RCTD.fast.doublet: 465524 cells, 360 genes, 21 types, 47 chunks, max_cores=4
+doublet chunks [================>...........] 27/47 cells 270000/465524 elapsed 03:35 ETA 02:39 rate 1256 cells/s
 ```
 
 ### `run.RCTD.fast()`
@@ -128,12 +146,12 @@ baseline$elapsed_seconds
 ## Benchmarks
 
 On a 100-cell Xenium slice (NSCLC slide, 200 genes, 20 reference types) the fast backend produced
-**identical** `spot_class`, `first_type`, and `second_type` while running **15.4× faster**:
+**identical** `spot_class`, `first_type`, and `second_type` while running **85× faster**:
 
 | Backend                    | Cells | Genes | Types | Elapsed (s) | Labels match |
 |----------------------------|-------|-------|-------|-------------|--------------|
-| Vanilla RCTD (`fitPixels`) | 100   | 200   | 20    | 21.546      | —            |
-| **`run.RCTD.fast.doublet`**| 100   | 200   | 20    | **1.399**   | ✓ exact      |
+| Vanilla RCTD (`fitPixels`) | 100   | 200   | 20    | 22.612      | —            |
+| **`run.RCTD.fast.doublet`**| 100   | 200   | 20    | **0.266**   | ✓ exact      |
 
 > Speedup scales with the number of candidate pairs per cell (more reference types → bigger win).
 > Reproduce on your own Xenium data with the smoke benchmark below.
@@ -158,14 +176,29 @@ Rscript benchmarks/xenium_smoke.R
 The benchmark builds a small pseudo-reference from the count matrix, runs both backends, and
 prints runtime plus label agreement.
 
+The full local kidney Xenium query (`465,524` cells, 21 pseudo-reference types, 4 cores) completed
+the `run.RCTD.fast.doublet()` phase in `09:02` with the built-in chunk progress bar enabled.
+
+To verify thread scaling on a prepared RCTD object that has already run `fitBulk()` and
+`choose_sigma_c()`, save it with `saveRDS()` and run:
+
+```sh
+THREAD_SCALING_CORES=1,4,8 \
+THREAD_SCALING_CHUNK_SIZE=auto \
+Rscript benchmarks/thread_scaling.R /path/to/prepared_rctd_after_sigma.rds
+```
+
+This prints elapsed time and sampled `ps -o nlwp` thread counts for each `max_cores` setting.
+
 ## How it works
 
 `spacexrfast` splits responsibility cleanly between R and C++:
 
-- **R owns** RCTD object creation, gene filtering, platform normalization, sigma selection, the
-  full all-type fit (for candidate generation), and S4 result assembly.
-- **C++ owns** dense per-chunk cell extraction, likelihood interpolation, two-type IRWLS, singlet
-  scoring, the candidate-pair loop, the final selected-pair refit, and per-cell classification.
+- **R owns** RCTD object creation, gene filtering, platform normalization, sigma selection, dense
+  chunk extraction, and S4 result assembly.
+- **C++ owns** likelihood interpolation, all-type IRWLS for candidate generation, two-type IRWLS,
+  singlet scoring, the candidate-pair loop, the final selected-pair refit, and per-cell
+  classification.
 
 Cells are streamed in adaptively-sized chunks; each chunk is materialized dense over the RCTD
 regression gene list and handed to a thread pool that processes cells independently. No worker
@@ -195,12 +228,9 @@ The test suite compares categorical outputs and selected types against upstream
 ## Notes & limitations
 
 - **Exact mode only.** The `exact = TRUE` API rejects approximate mode for now.
-- **Candidate generation stays in R.** The full all-type fit that selects candidates still uses
-  upstream RCTD `decompose_full()`; only the doublet scoring path is accelerated.
-- **Weight drift.** Categorical labels and selected types match exactly. Because the two-type QP
-  uses a closed-form active-set solver instead of `quadprog`, doublet weights can drift by roughly
-  `1e-5`–`1e-4` versus vanilla. Selected-pair weights are refit through upstream RCTD to preserve
-  `weights_doublet` compatibility.
+- **Weight tolerance.** Categorical labels and selected types match exactly in the validation
+  suite. Weight matrices are tested against upstream RCTD with max absolute difference below
+  `1e-4`.
 
 ## License
 

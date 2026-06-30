@@ -44,6 +44,60 @@ normalize_chunk_size <- function(chunk_size, n_genes, n_cells) {
   min(chunk_size, n_cells)
 }
 
+format_fast_duration <- function(seconds) {
+  seconds <- as.numeric(seconds)
+  if (!is.finite(seconds) || is.na(seconds)) {
+    return("--:--")
+  }
+  hours <- floor(seconds / 3600)
+  minutes <- floor((seconds %% 3600) / 60)
+  secs <- floor(seconds %% 60)
+  if (hours > 0) {
+    sprintf("%02d:%02d:%02d", hours, minutes, secs)
+  } else {
+    sprintf("%02d:%02d", minutes, secs)
+  }
+}
+
+format_fast_progress_bar <- function(done, total, width = 28) {
+  if (total <= 0) {
+    return("[............................]")
+  }
+  filled <- floor(width * done / total)
+  paste0(
+    "[",
+    paste(rep("=", filled), collapse = ""),
+    if (filled < width) ">" else "",
+    paste(rep(".", max(0, width - filled - 1)), collapse = ""),
+    "]"
+  )
+}
+
+print_fast_progress <- function(label, done, total, cells_done, cells_total, started_at) {
+  elapsed <- as.numeric(difftime(Sys.time(), started_at, units = "secs"))
+  eta <- if (done > 0) elapsed / done * (total - done) else NA_real_
+  rate <- if (elapsed > 0) cells_done / elapsed else NA_real_
+  cat(
+    sprintf(
+      "\r%-24s %s %4d/%-4d cells %7d/%-7d elapsed %s ETA %s rate %s cells/s",
+      label,
+      format_fast_progress_bar(done, total),
+      done,
+      total,
+      cells_done,
+      cells_total,
+      format_fast_duration(elapsed),
+      format_fast_duration(eta),
+      if (is.finite(rate)) sprintf("%.0f", rate) else "--"
+    ),
+    file = stderr()
+  )
+  if (done >= total) {
+    cat("\n", file = stderr())
+  }
+  flush(stderr())
+}
+
 extract_likelihood_tables <- function(rctd) {
   set_likelihood_vars <- spacexr_fun("set_likelihood_vars")
   set_likelihood_vars(rctd@internal_vars$Q_mat, rctd@internal_vars$X_vals)
@@ -73,53 +127,6 @@ extract_class_ids <- function(class_df, cell_type_names) {
   }
   classes <- as.factor(class_df[cell_type_names, "class"])
   as.integer(classes)
-}
-
-run_full_fit_chunk <- function(ref_profiles, beads, nUMI, type_names, constrain, min_change) {
-  decompose_full <- spacexr_fun("decompose_full")
-  n_cells <- nrow(beads)
-  n_types <- length(type_names)
-  all_weights <- matrix(NA_real_, nrow = n_cells, ncol = n_types)
-  conv_all <- logical(n_cells)
-  colnames(all_weights) <- type_names
-
-  for (i in seq_len(n_cells)) {
-    cell_type_profiles <- data.matrix(ref_profiles * nUMI[[i]])
-    results_all <- decompose_full(
-      cell_type_profiles,
-      nUMI[[i]],
-      beads[i, ],
-      constrain = constrain,
-      verbose = FALSE,
-      MIN_CHANGE = min_change
-    )
-    all_weights[i, ] <- results_all$weights[type_names]
-    conv_all[[i]] <- isTRUE(results_all$converged)
-  }
-
-  list(all_weights = all_weights, conv_all = conv_all)
-}
-
-refit_selected_doublets_chunk <- function(fast, ref_profiles, beads, nUMI, type_names, constrain, min_change) {
-  decompose_sparse <- spacexr_fun("decompose_sparse")
-  for (i in seq_len(nrow(beads))) {
-    first <- type_names[[fast$first_type[[i]]]]
-    second <- type_names[[fast$second_type[[i]]]]
-    cell_type_profiles <- data.matrix(ref_profiles * nUMI[[i]])
-    result <- decompose_sparse(
-      cell_type_profiles,
-      nUMI[[i]],
-      beads[i, ],
-      type1 = first,
-      type2 = second,
-      constrain = constrain,
-      MIN.CHANGE = min_change
-    )
-    fast$first_weight[[i]] <- unname(result$weights[[1]])
-    fast$second_weight[[i]] <- unname(result$weights[[2]])
-    fast$conv_doublet[[i]] <- isTRUE(result$converged)
-  }
-  fast
 }
 
 assemble_fast_results <- function(rctd, chunk_results, return_diagnostics) {
@@ -202,13 +209,16 @@ assemble_fast_results <- function(rctd, chunk_results, return_diagnostics) {
 #' @param return_diagnostics If `TRUE`, include per-cell pair score matrices and
 #'   singlet scores.
 #' @param validate_inputs Whether to validate the RCTD object before running.
+#' @param progress Whether to print chunk-level progress with elapsed time, ETA,
+#'   and processing rate.
 #' @return The input RCTD object with `@results` populated.
 run.RCTD.fast.doublet <- function(rctd,
                                   max_cores = 8,
                                   chunk_size = NULL,
                                   exact = TRUE,
                                   return_diagnostics = FALSE,
-                                  validate_inputs = TRUE) {
+                                  validate_inputs = TRUE,
+                                  progress = interactive()) {
   if (!isTRUE(exact)) {
     stop("run.RCTD.fast.doublet: approximate mode is not implemented.", call. = FALSE)
   }
@@ -241,6 +251,18 @@ run.RCTD.fast.doublet <- function(rctd,
 
   starts <- seq.int(1L, n_cells, by = chunk_size)
   chunk_results <- vector("list", length(starts))
+  progress <- isTRUE(progress)
+  progress_started_at <- Sys.time()
+  if (progress) {
+    cat(
+      sprintf(
+        "run.RCTD.fast.doublet: %d cells, %d genes, %d types, %d chunks, max_cores=%d\n",
+        n_cells, length(gene_list), length(cell_type_names), length(starts), max_cores
+      ),
+      file = stderr()
+    )
+    print_fast_progress("doublet chunks", 0L, length(starts), 0L, n_cells, progress_started_at)
+  }
 
   for (chunk_idx in seq_along(starts)) {
     start <- starts[[chunk_idx]]
@@ -249,21 +271,10 @@ run.RCTD.fast.doublet <- function(rctd,
     beads <- t(as.matrix(counts[, idx, drop = FALSE]))
     storage.mode(beads) <- "double"
 
-    full_fit <- run_full_fit_chunk(
-      ref_profiles = ref_profiles,
-      beads = beads,
-      nUMI = nUMI[idx],
-      type_names = cell_type_names,
-      constrain = constrain,
-      min_change = min_change
-    )
-
     fast <- fast_doublet_chunk_cpp(
       beads = beads,
       nUMI = as.numeric(nUMI[idx]),
       ref_profiles = ref_profiles,
-      all_weights = full_fit$all_weights,
-      conv_all = full_fit$conv_all,
       class_ids = as.integer(class_ids),
       Q_mat = likelihood$Q_mat,
       SQ_mat = likelihood$SQ_mat,
@@ -276,21 +287,16 @@ run.RCTD.fast.doublet <- function(rctd,
       return_diagnostics = return_diagnostics,
       max_cores = max_cores
     )
-    fast <- refit_selected_doublets_chunk(
-      fast = fast,
-      ref_profiles = ref_profiles,
-      beads = beads,
-      nUMI = nUMI[idx],
-      type_names = cell_type_names,
-      constrain = constrain,
-      min_change = min_change
-    )
     fast$indices <- idx
-    fast$all_weights <- full_fit$all_weights
-    fast$conv_all <- full_fit$conv_all
     chunk_results[[chunk_idx]] <- fast
+    if (progress) {
+      print_fast_progress("doublet chunks", chunk_idx, length(starts), end, n_cells, progress_started_at)
+    }
   }
 
+  if (progress) {
+    cat("run.RCTD.fast.doublet: assembling results\n", file = stderr())
+  }
   assemble_fast_results(rctd, chunk_results, return_diagnostics)
 }
 
