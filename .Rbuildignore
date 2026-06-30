@@ -2,5 +2,6 @@
 ^IMPLEMENTATION_PLAN\.md$
 ^benchmarks$
 ^docs$
+^\.github$
 ^\.git$
 ^\.gitignore$

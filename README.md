@@ -3,6 +3,8 @@
 [![License: GPL-3](https://img.shields.io/badge/License-GPL%203-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Language: R + C++](https://img.shields.io/badge/built%20with-R%20%2B%20C%2B%2B-198ce7.svg)](https://www.rcpp.org/)
 [![Version](https://img.shields.io/badge/version-0.1.0-brightgreen.svg)](DESCRIPTION)
+[![R package check](https://github.com/PABannier/spacexrfast/actions/workflows/r-check.yaml/badge.svg)](https://github.com/PABannier/spacexrfast/actions/workflows/r-check.yaml)
+[![Kidney H5AD example](https://github.com/PABannier/spacexrfast/actions/workflows/kidney-h5ad-example.yaml/badge.svg)](https://github.com/PABannier/spacexrfast/actions/workflows/kidney-h5ad-example.yaml)
 
 **A drop-in, exact-preserving doublet-mode backend for [spacexr](https://github.com/dmcable/spacexr) RCTD — much faster on Xenium slides, with identical cell-type calls.**
 
@@ -59,6 +61,20 @@ millions of cells, that overhead dominates.
 
 **Prerequisites:** R (≥ 4.0), a C++ compiler with `GNU make`, and
 [`spacexr`](https://github.com/dmcable/spacexr) installed.
+
+Install online from GitHub:
+
+```r
+install.packages("pak")
+pak::pak("PABannier/spacexrfast")
+```
+
+or with `remotes`:
+
+```r
+install.packages("remotes")
+remotes::install_github("PABannier/spacexrfast")
+```
 
 Install from this checkout:
 
@@ -224,6 +240,39 @@ R CMD check --no-manual --no-vignettes spacexrfast_0.1.0.tar.gz
 
 The test suite compares categorical outputs and selected types against upstream
 `process_bead_doublet()` and `fitPixels()` on synthetic fixtures.
+
+### Continuous integration
+
+GitHub Actions runs two checks:
+
+- `R package check`: installs `spacexr` from GitHub, installs package dependencies, and runs
+  `R CMD check --no-manual --no-vignettes`.
+- `Kidney H5AD example`: downloads the public 10x renal carcinoma Xenium RNA AnnData matrix
+  mirrored on Figshare (`10x_rcc_rna.h5ad`), caches it, restricts the example to 1000 cells,
+  builds a small pseudo-reference, runs upstream RCTD doublet mode and
+  `run.RCTD.fast.doublet()`, and fails if labels differ or weights exceed `2e-4`.
+
+The real-data workflow prints timestamped step logs plus the fast backend's chunk progress
+line with elapsed time, ETA, and cells per second. To run it manually from GitHub, open
+`Actions -> Kidney H5AD example -> Run workflow` and adjust the cell/gene/type/core inputs if
+needed.
+
+The workflow uses this default public data URL:
+
+```text
+https://ndownloader.figshare.com/files/61982293
+```
+
+For a local run of the same CI example:
+
+```sh
+KIDNEY_H5AD="/path/to/10x_rcc_rna.h5ad" \
+KIDNEY_EXAMPLE_CELLS=1000 \
+KIDNEY_EXAMPLE_GENES=80 \
+KIDNEY_EXAMPLE_TYPES=4 \
+KIDNEY_EXAMPLE_CORES=2 \
+Rscript benchmarks/kidney_h5ad_ci.R
+```
 
 ## Notes & limitations
 
