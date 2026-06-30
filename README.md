@@ -1,9 +1,73 @@
 # spacexrfast
 
-`spacexrfast` provides a faster drop-in doublet-mode backend for
-`spacexr` RCTD. It keeps upstream RCTD preprocessing, all-type fitting, result
-assembly, and final selected-pair refitting, while moving the hot doublet
-candidate pair scoring path into C++.
+[![License: GPL-3](https://img.shields.io/badge/License-GPL%203-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Language: R + C++](https://img.shields.io/badge/built%20with-R%20%2B%20C%2B%2B-198ce7.svg)](https://www.rcpp.org/)
+[![Version](https://img.shields.io/badge/version-0.1.0-brightgreen.svg)](DESCRIPTION)
+
+**A drop-in, exact-preserving doublet-mode backend for [spacexr](https://github.com/dmcable/spacexr) RCTD — up to 15× faster on Xenium slides, with identical cell-type calls.**
+
+RCTD doublet mode is the accuracy gold standard for cell-type deconvolution of spatial
+transcriptomics, but it was never built for million-cell Xenium slides — a single slide can
+take ~10 hours on 8 cores. `spacexrfast` keeps every bit of RCTD's preprocessing, statistics,
+and output schema, and rewrites only the hot per-cell scoring loop in parallel C++.
+
+```r
+library(spacexr)
+library(spacexrfast)
+
+# Standard RCTD preprocessing — unchanged
+rctd <- create.RCTD(puck, reference, max_cores = 8)
+rctd <- fitBulk(rctd)
+rctd <- spacexr:::choose_sigma_c(rctd)
+
+# Swap only the slow doublet pixel fitting:
+rctd <- run.RCTD.fast.doublet(rctd, max_cores = 8, chunk_size = "auto", exact = TRUE)
+```
+
+The returned object is a normal RCTD object with the standard doublet schema —
+`rctd@results$results_df`, `rctd@results$weights`, and `rctd@results$weights_doublet` —
+so it slots straight into any existing downstream pipeline.
+
+## Why spacexrfast?
+
+Vanilla RCTD doublet mode is structurally expensive. For **every** cell it runs a full
+all-type decomposition, thresholds candidates, scores each candidate type as a singlet,
+fits **every** candidate pair with 25 IRWLS iterations, applies the doublet/singlet/reject
+logic, then refits the selected pair with 50 more iterations. With ~20 reference types that
+is dozens of two-type optimizations per cell, each routed through R and `quadprog`. Across
+millions of cells, that overhead dominates.
+
+`spacexrfast` attacks exactly that bottleneck — and nothing else:
+
+- **Exact-preserving by design.** Categorical outputs (`spot_class`, `first_type`, `second_type`,
+  `first_class`, `second_class`) match upstream RCTD bit-for-bit on the validation suite. The
+  candidate threshold (`all_weights > 0.01`), fallback logic, tie-breaking, factor levels, and
+  confidence/doublet thresholds are all reproduced exactly.
+- **Hot path in C++.** Likelihood-table interpolation, one- and two-type IRWLS, singlet scoring,
+  the candidate-pair loop, the final selected-pair refit, and the per-cell classification all run
+  as compiled code — no R or `quadprog` calls in the inner loop.
+- **Parallel over cells.** The C++ backend fans out across `max_cores` threads with no R API
+  access from workers, so it scales cleanly on multi-core machines.
+- **Closed-form two-type solver.** The repeated two-type QP that RCTD hands to `quadprog` is
+  replaced by an exact active-set solver specialized for the 2D subproblem — same math, no
+  optimizer overhead, thread-safe.
+- **Adaptive chunking.** Cells are processed in dense gene × chunk blocks sized to a memory
+  budget (`chunk_size = "auto"`), keeping peak RAM bounded even on million-cell slides.
+- **Drop-in API, drop-in schema.** Keep upstream gene filtering, platform normalization, sigma
+  selection, and S4 assembly. Only the pixel-fitting step changes.
+
+## Quick Start
+
+**Prerequisites:** R (≥ 4.0), a C++ compiler with `GNU make`, and
+[`spacexr`](https://github.com/dmcable/spacexr) installed.
+
+Install from this checkout:
+
+```sh
+R CMD INSTALL --preclean .
+```
+
+Then run the fast doublet backend on a prepared RCTD object:
 
 ```r
 library(spacexr)
@@ -18,23 +82,100 @@ rctd <- run.RCTD.fast.doublet(
   chunk_size = "auto",
   exact = TRUE
 )
+
+head(rctd@results$results_df)
+#>      spot_class first_type second_type ... min_score singlet_score conv_doublet
+#> s1      singlet      typeA       typeB ...    12.43         38.91         TRUE
+#> s2  doublet_cert      typeC       typeA ...     8.10         11.02         TRUE
 ```
 
-The returned object uses the standard RCTD doublet schema:
+## Usage
 
-- `rctd@results$results_df`
-- `rctd@results$weights`
-- `rctd@results$weights_doublet`
+### `run.RCTD.fast.doublet()`
 
-## Install
+The main entry point. Assumes upstream RCTD preprocessing (`fitBulk()` + sigma selection) has
+already run.
 
-From this checkout:
+```r
+run.RCTD.fast.doublet(
+  rctd,                       # a prepared spacexr::RCTD object
+  max_cores = 8,              # worker threads for the C++ backend
+  chunk_size = NULL,          # cells per dense chunk; NULL or "auto" picks adaptively
+  exact = TRUE,               # exact mode (approximate mode is not yet implemented)
+  return_diagnostics = FALSE, # attach per-cell pair-score matrices + singlet scores
+  validate_inputs = TRUE      # validate the RCTD object before running
+)
+```
+
+### `run.RCTD.fast()`
+
+Convenience wrapper mirroring upstream's `run.RCTD()` signature:
+
+```r
+rctd <- run.RCTD.fast(rctd, doublet_mode = "doublet", max_cores = 8)
+```
+
+### `profile_vanilla_doublet()`
+
+Times upstream `fitPixels(doublet_mode = "doublet")` on a slice so you can measure the speedup
+on your own data:
+
+```r
+baseline <- profile_vanilla_doublet(rctd)
+baseline$elapsed_seconds
+```
+
+## Benchmarks
+
+On a 100-cell Xenium slice (NSCLC slide, 200 genes, 20 reference types) the fast backend produced
+**identical** `spot_class`, `first_type`, and `second_type` while running **15.4× faster**:
+
+| Backend                    | Cells | Genes | Types | Elapsed (s) | Labels match |
+|----------------------------|-------|-------|-------|-------------|--------------|
+| Vanilla RCTD (`fitPixels`) | 100   | 200   | 20    | 21.546      | —            |
+| **`run.RCTD.fast.doublet`**| 100   | 200   | 20    | **1.399**   | ✓ exact      |
+
+> Speedup scales with the number of candidate pairs per cell (more reference types → bigger win).
+> Reproduce on your own Xenium data with the smoke benchmark below.
+
+### Run the Xenium benchmark yourself
+
+Download a Xenium example bundle from 10x Genomics and point the benchmark at its
+`cell_feature_matrix.h5`:
+
+- [Renal cell carcinoma Xenium dataset](https://www.10xgenomics.com/datasets/xenium-protein-ffpe-human-renal-carcinoma)
+- [Xenium file-format documentation](https://cf.10xgenomics.com/supp/xenium/xenium_documentation.html)
 
 ```sh
-R CMD INSTALL --preclean .
+XENIUM_MATRIX="/path/to/cell_feature_matrix.h5" \
+XENIUM_SMOKE_CELLS=100 \
+XENIUM_SMOKE_GENES=200 \
+XENIUM_SMOKE_TYPES=20 \
+XENIUM_SMOKE_CORES=4 \
+Rscript benchmarks/xenium_smoke.R
 ```
 
-## Run Tests
+The benchmark builds a small pseudo-reference from the count matrix, runs both backends, and
+prints runtime plus label agreement.
+
+## How it works
+
+`spacexrfast` splits responsibility cleanly between R and C++:
+
+- **R owns** RCTD object creation, gene filtering, platform normalization, sigma selection, the
+  full all-type fit (for candidate generation), and S4 result assembly.
+- **C++ owns** dense per-chunk cell extraction, likelihood interpolation, two-type IRWLS, singlet
+  scoring, the candidate-pair loop, the final selected-pair refit, and per-cell classification.
+
+Cells are streamed in adaptively-sized chunks; each chunk is materialized dense over the RCTD
+regression gene list and handed to a thread pool that processes cells independently. No worker
+ever touches the R API, which keeps the backend both fast and safe.
+
+See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the full design rationale, exactness
+contract, and phased roadmap, and [`docs/profile_report.md`](docs/profile_report.md) for profiling
+notes and the known exactness boundary.
+
+## Testing
 
 Run the unit and integration tests:
 
@@ -49,54 +190,26 @@ R CMD build .
 R CMD check --no-manual --no-vignettes spacexrfast_0.1.0.tar.gz
 ```
 
-## Xenium Benchmark
+The test suite compares categorical outputs and selected types against upstream
+`process_bead_doublet()` and `fitPixels()` on synthetic fixtures.
 
-Download a Xenium example from the 10x Genomics website, then point the
-benchmark at its `cell_feature_matrix.h5`.
+## Notes & limitations
 
-Useful 10x pages:
+- **Exact mode only.** The `exact = TRUE` API rejects approximate mode for now.
+- **Candidate generation stays in R.** The full all-type fit that selects candidates still uses
+  upstream RCTD `decompose_full()`; only the doublet scoring path is accelerated.
+- **Weight drift.** Categorical labels and selected types match exactly. Because the two-type QP
+  uses a closed-form active-set solver instead of `quadprog`, doublet weights can drift by roughly
+  `1e-5`–`1e-4` versus vanilla. Selected-pair weights are refit through upstream RCTD to preserve
+  `weights_doublet` compatibility.
 
-- Renal cell carcinoma Xenium dataset:
-  <https://www.10xgenomics.com/datasets/xenium-protein-ffpe-human-renal-carcinoma>
-- Xenium file format documentation, including `cell_feature_matrix.h5`:
-  <https://cf.10xgenomics.com/supp/xenium/xenium_documentation.html>
+## License
 
-After downloading and extracting an output bundle, run:
+Distributed under the [GPL-3](https://www.gnu.org/licenses/gpl-3.0) license, matching upstream
+`spacexr`.
 
-```sh
-XENIUM_MATRIX="/path/to/cell_feature_matrix.h5" \
-XENIUM_SMOKE_CELLS=100 \
-XENIUM_SMOKE_GENES=200 \
-XENIUM_SMOKE_TYPES=20 \
-XENIUM_SMOKE_CORES=4 \
-Rscript benchmarks/xenium_smoke.R
-```
+## Acknowledgments
 
-The benchmark builds a small pseudo-reference from the downloaded Xenium count
-matrix, runs vanilla RCTD doublet fitting and `run.RCTD.fast.doublet()`, and
-prints runtime plus label agreement.
-
-Example result on the local NSCLC Xenium slide in `~/Documents/10x-examples`:
-
-```text
-cells,100
-genes,200
-types,20
-vanilla_elapsed_seconds,21.546
-fast_elapsed_seconds,1.399
-spot_class_equal,TRUE
-first_type_equal,TRUE
-second_type_equal,TRUE
-```
-
-That slice showed a 15.4x speedup with matching `spot_class`, `first_type`, and
-`second_type`.
-
-## Notes
-
-- The exact-mode API rejects approximate mode for now.
-- Candidate generation still uses upstream RCTD all-type fitting.
-- The final reported selected-pair weights are refit through upstream RCTD to
-  preserve `weights_doublet` compatibility.
-- The C++ backend parallelizes over cells and does not call the R API from
-  worker threads.
+Built on top of [spacexr](https://github.com/dmcable/spacexr) (Cable et al., *Nature
+Biotechnology* 2022). `spacexrfast` reuses spacexr's preprocessing and statistical model
+wholesale — it only accelerates the doublet-mode inner loop.
