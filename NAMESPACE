@@ -1,0 +1,7 @@
+useDynLib(spacexrfast, .registration = TRUE)
+export(run.RCTD.fast)
+export(run.RCTD.fast.doublet)
+export(profile_vanilla_doublet)
+import(spacexr)
+importFrom(methods, is)
+importFrom(Rcpp, evalCpp)

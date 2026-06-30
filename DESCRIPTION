@@ -1,0 +1,27 @@
+Package: spacexrfast
+Title: Fast Exact-Preserving Doublet Backend for spacexr RCTD
+Version: 0.1.0
+Authors@R:
+    person("Moira", "Team", role = c("aut", "cre"), email = "noreply@example.com")
+Author: Moira Team [aut, cre]
+Maintainer: Moira Team <noreply@example.com>
+Description: Provides a drop-in chunked doublet-mode replacement for spacexr
+    RCTD, preserving upstream preprocessing and result schema while moving
+    repeated two-type doublet scoring and refitting into C++.
+License: GPL-3
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports:
+    Matrix,
+    methods,
+    Rcpp,
+    spacexr
+LinkingTo:
+    Rcpp
+Suggests:
+    rhdf5,
+    Seurat,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+SystemRequirements: GNU make
