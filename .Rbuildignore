@@ -1,0 +1,6 @@
+^LICENSE$
+^IMPLEMENTATION_PLAN\.md$
+^benchmarks$
+^docs$
+^\.git$
+^\.gitignore$
