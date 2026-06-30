@@ -2,9 +2,9 @@ Package: spacexrfast
 Title: Fast Exact-Preserving Doublet Backend for spacexr RCTD
 Version: 0.1.0
 Authors@R:
-    person("Moira", "Team", role = c("aut", "cre"), email = "noreply@example.com")
-Author: Moira Team [aut, cre]
-Maintainer: Moira Team <noreply@example.com>
+    person("Pierre-Antoine", "Bannier", role = c("aut", "cre"), email = "pierreantoine.bannier@gmail.com")
+Author: Pierre-Antoine Bannier [aut, cre]
+Maintainer: Pierre-Antoine Bannier <pierreantoine.bannier@gmail.com>
 Description: Provides a drop-in chunked doublet-mode replacement for spacexr
     RCTD, preserving upstream preprocessing and result schema while moving
     repeated two-type doublet scoring and refitting into C++.
