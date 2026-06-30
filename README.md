@@ -171,9 +171,8 @@ Cells are streamed in adaptively-sized chunks; each chunk is materialized dense 
 regression gene list and handed to a thread pool that processes cells independently. No worker
 ever touches the R API, which keeps the backend both fast and safe.
 
-See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the full design rationale, exactness
-contract, and phased roadmap, and [`docs/profile_report.md`](docs/profile_report.md) for profiling
-notes and the known exactness boundary.
+See [`docs/profile_report.md`](docs/profile_report.md) for profiling notes and the known
+exactness boundary.
 
 ## Testing
 
